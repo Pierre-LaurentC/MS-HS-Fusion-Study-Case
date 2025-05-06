@@ -108,7 +108,10 @@ class Mirim_Model_For_Fusion(LinOp):
         self.shape_target = shape_target
 
         specs = L_specs[np.newaxis, :, :, np.newaxis, np.newaxis]  # (1, 5, 300, 1, 1)
-        psfs = psfs_monoch[np.newaxis, np.newaxis, ...]  # (1, 1, 300, 250, 500)
+        
+        # psfs = psfs_monoch[np.newaxis, np.newaxis, ...]  # (1, 1, 300, 250, 500)
+        psfs = psfs_monoch[:, np.newaxis, np.newaxis, :, :]
+
         L_pce = unit_conversion(L_pce, lamb_cube * 1e-6, pixel_arcsec)
         pce = L_pce[:, np.newaxis, :, np.newaxis, np.newaxis]  # (9, 1, 300, 1, 1)
         
@@ -182,6 +185,8 @@ class Mirim_Model_For_Fusion_2(LinOp):
 
         # specs = L_specs[np.newaxis, :, :, np.newaxis, np.newaxis]  # (1, 5, 300, 1, 1)
         psfs = psfs_monoch[np.newaxis, np.newaxis, ...]  # (1, 1, 300, 250, 500)
+        # psfs = psfs_monoch[:, np.newaxis, np.newaxis, :, :]
+
         L_pce = unit_conversion(L_pce, lamb_cube * 1e-6, pixel_arcsec)
         pce = L_pce[:, np.newaxis, :, np.newaxis, np.newaxis]  # (9, 1, 300, 1, 1)
         
@@ -1324,7 +1329,8 @@ class Imager_Model(LinOp):
 
         # 1) store PSFs with a spectral axis for broadcasting
         #    shape -> (1, 1, L, H_psf, W_psf)
-        self.psfs = psfs_monoch[np.newaxis, np.newaxis, ...]
+        # self.psfs = psfs_monoch[np.newaxis, np.newaxis, ...]
+        self.psfs = psfs_monoch[:, np.newaxis, np.newaxis, :, :]
 
         # 2) unit-convert PCE, then reshape -> (B, 1, L, 1, 1)
         L_pce_conv = unit_conversion(L_pce, lamb_cube * 1e-6, pixel_arcsec)
