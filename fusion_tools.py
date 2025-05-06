@@ -12,7 +12,7 @@ import os
 from udft import laplacian, irdftn, rdft2, ir2fr, diff_ir, dftn, idft2, dft2
 from einops import einsum, rearrange, reduce, repeat
 
-main_path = "/home/dpineau/mycode/ms-hs-fusion-study-case"
+main_path = "/home/plcristille/dev/JWST/fusion_inverse/MS-HS-Fusion-Study-Case"
 os.chdir(main_path)
 
 from instrument_models import concatenating2, Spectro_Model_3, partitioning_einops2, Mirim_Model_For_Fusion, make_iHtH_spectro

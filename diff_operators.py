@@ -8,8 +8,8 @@ Created on Wed Mar  1 10:58:35 2023
 
 import numpy as np
 from udft import laplacian, irdftn, rdft2, ir2fr, diff_ir
-from aljabr import Diff
-import aljabr
+from linop import Diff, LinOp
+# import aljabr
 
 
 #%% MAKE DIFFERENCE OPERATORS FOR REGULARIZATION
@@ -51,7 +51,7 @@ class Difference_Operator_Sep:  # separated gradients
         )
 
 # much faster than Difference_Operator_Sep, and supposed to give same output
-class NpDiff_r(aljabr.LinOp): # dim = 3
+class NpDiff_r(LinOp): # dim = 3
     def __init__(self, maps_shape):
         super().__init__(
             ishape=maps_shape,
@@ -64,7 +64,7 @@ class NpDiff_r(aljabr.LinOp): # dim = 3
     def adjoint(self, y):
         return np.diff(np.pad(y, ((0, 0), (0, 1), (0, 0)), 'wrap'), axis=1)
 
-class NpDiff_c(aljabr.LinOp): # dim = 3
+class NpDiff_c(LinOp): # dim = 3
     def __init__(self, maps_shape):
         super().__init__(
             ishape=maps_shape,

@@ -13,7 +13,7 @@ from qmm import QuadObjective, lcg, Huber, pcg
 from udft import idft2, dft2
 from einops import einsum
 
-main_path = "/home/dpineau/mycode/ms-hs-fusion-study-case"
+main_path = "/home/plcristille/dev/JWST/fusion_inverse/MS-HS-Fusion-Study-Case"
 os.chdir(main_path)
 
 from instrument_models import concatenating2, Spectro_Model_3, partitioning_einops2, Mirim_Model_For_Fusion

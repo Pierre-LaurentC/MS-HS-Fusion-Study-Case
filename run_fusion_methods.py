@@ -7,13 +7,14 @@ Created on Tue Apr 29 20:05:21 2025
 """
 
 
-import aljabr
+# import aljabr
+from linop import dottest, fwadjtest
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 import os
 
-main_path = "/home/dpineau/mycode/ms-hs-fusion-study-case"
+main_path = "/home/plcristille/dev/JWST/fusion_inverse/MS-HS-Fusion-Study-Case"
 # data_path = "/home/dpineau/Bureau/data/mycube"
 data_path = main_path + "/data"
 output_path = main_path + "/output"
@@ -108,8 +109,8 @@ spectro_model = Spectro_Model_3(
     psfs_monoch, L_pce_spectro, di, dj, lamb_cube, L_specs, shape_target
 )
 
-print(aljabr.dottest(spectro_model))
-print(aljabr.fwadjtest(spectro_model))
+print(dottest(spectro_model))
+print(fwadjtest(spectro_model))
 
 
 #%% DONNÉES INSTRUMENTS BRUITÉES

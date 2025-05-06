@@ -15,7 +15,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import normalized_root_mse as nrmse
 # from sklearn.metrics import mean_squared_error as mse
 
-main_path = "/home/dpineau/mycode/ms-hs-fusion-study-case"
+main_path = "/home/plcristille/dev/JWST/fusion_inverse/MS-HS-Fusion-Study-Case"
 os.chdir(main_path)
 
 from noise_data import get_snr
