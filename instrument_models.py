@@ -952,9 +952,9 @@ def partitioning_einops2_MS(cube, di, dj):
     )
     return new_cube
 
-class Spectro_Model_3(LinOp):
+class Spectro_Model_Initial(LinOp):
     def __init__(
-        self, psfs_monoch, L_pce, di:int, dj:int, lamb_cube, L_specs, shape_target, old_model=False, pixel_arcsec=0.111 # size of pixels before integration and decimation of spectro
+        self, psfs_monoch, L_pce, di:int, dj:int, lamb_cube, L_specs, shape_target, pixel_arcsec=0.111 # size of pixels before integration and decimation of spectro
     ):
         assert shape_target[0] % di == 0
         assert shape_target[1] % dj == 0
@@ -962,8 +962,238 @@ class Spectro_Model_3(LinOp):
         assert psfs_monoch.shape[1] <= shape_target[0] # otherwise ir2fr impossible
         assert psfs_monoch.shape[2] <= shape_target[1]
         
-        self.old_model = old_model
+        kernel_for_sum = np.ones((di, dj)) # le flux est bien intégré sur toute la surface du pixel, sans normalisation
+        kernel_for_sum_freq = ir2fr(kernel_for_sum, shape_target, real=False)[np.newaxis, ...] # (1, 250, 500)
+    
+        psfs_freq = ir2fr(
+            psfs_monoch * L_pce[:, np.newaxis, np.newaxis],
+            shape=shape_target,
+            real=False,
+        ) * kernel_for_sum_freq
+        
+        # # translation dans Fourier pour sauvegarde de la convolution en haut à gauche
+        # # MÉTHODE 1
+        decal = np.zeros(shape_target)
+        dsi = int((di-1)/2)
+        dsj = int((dj-1)/2)
+        # if ds != 0:
+        #     ds = 0
+        # print("dsi", dsi, "dsj", dsj)
+        decal[- dsi, - dsj] = np.sqrt(shape_target[0] * shape_target[1]) # surement pour annuler les normalisations qui arrivent dans le passage de Fourier ?
+        decalf = dft2(decal)
 
+        h_block, w_block = int(shape_target[0] / di), int(shape_target[1] / dj)
+        
+        # partitionnement
+        # part_psfs_freq_full = partitioning_einops2(psfs_freq, di, dj)
+        part_psfs_freq_full = partitioning_einops2(psfs_freq * decalf, di, dj)
+        # print("part_psfs_freq_full", part_psfs_freq_full.shape)
+
+        # conjugué des psfs partitionnées
+        conj_part_psfs_freq_full = np.conj(part_psfs_freq_full)
+        # print("conj_part_psfs_freq_full", conj_part_psfs_freq_full.shape)
+
+        # produit des psfs avec les conjuguées
+        # (300, 1, 25, 50, 100) * (300, 25, 1, 50, 100) = (300, 25, 25, 50, 100)
+        mat = (
+            (1 / (di * dj))
+            * part_psfs_freq_full[:, np.newaxis, ...]
+            * conj_part_psfs_freq_full[:, :, np.newaxis, ...]
+        )
+        # print("mat", mat.shape)
+
+        # création de HtH
+        L_specs_converted = unit_conversion(L_specs, lamb_cube * 1e-6, pixel_arcsec)
+        specs = L_specs_converted[
+            :, :, np.newaxis, np.newaxis, np.newaxis, np.newaxis
+        ]  # (5, 300, 1, 1)
+        # print("check1")
+        n_spec = specs.shape[0]
+        HtH_freq = np.zeros(
+            (n_spec, n_spec, di * dj, di * dj, h_block, w_block), dtype=complex
+        )
+        # print("check2")
+        for k1 in range(n_spec):
+            for k2 in range(k1, n_spec):
+                HtH_freq[k1, k2] += np.sum(specs[k1] * specs[k2] * mat, axis=0)
+
+        # print("check3")
+        # utilisation de la symétrie de HtH
+        for k1 in range(n_spec):
+            for k2 in range(k1):
+                HtH_freq[k1, k2] += HtH_freq[k2, k1]
+
+        self.hess_spec_freq = HtH_freq
+
+        # H_spec_freq utile pour forward et adjoint
+        # self.H_spec_freq = make_H_spec_freq_sum2(
+        #     psfs_monoch, L_pce, lamb_cube, L_specs, shape_target, di, dj
+        # )
+        
+        # print("2 x H_spec_freq enlevés !!")
+        
+        self.H_spec_freq = make_H_spec_freq_sum2(
+            psfs_monoch, L_pce, lamb_cube, L_specs, shape_target, di, dj
+        ) * rdft2(decal)[np.newaxis, np.newaxis, :, :]
+        
+        # utile pour forward_freq_to_freq et forward_freq_to_real
+        self.H_spec_freq_full = make_H_spec_freq_sum_full(
+            psfs_monoch, L_pce, lamb_cube, L_specs, shape_target, di, dj
+        ) * decalf[np.newaxis, np.newaxis, :, :]
+        
+        self.di = di
+        self.dj = dj
+        self.shape_target = shape_target
+        self.n_lamb = lamb_cube.shape[0]
+        self.n_spec = n_spec
+        self.L_pce = L_pce
+        self.psfs_monoch = psfs_monoch
+
+        super().__init__(
+            ishape=(self.n_spec, shape_target[0], shape_target[1]),
+            oshape=(self.n_lamb, shape_target[0] // di, shape_target[1] // dj),
+        )
+
+    def forward(self, x): # input and output in real, costs 1
+        assert x.shape == self.ishape
+        
+        x_freq = rdft2(x)[:, np.newaxis, ...]  # (5, 1, 250, 251)
+        H_spec_x_freq = np.sum(
+            self.H_spec_freq * x_freq, axis=0
+        )  # (5, 300, 250, 251) * (5, 1, 250, 251) = (300, 250, 251))
+        convoluted_cube = irdftn(H_spec_x_freq, self.shape_target)  # (300, 250, 500)
+
+        # make decimated cube
+        decimated_cube = convoluted_cube[
+            :, :: self.di, :: self.dj
+        ]  # (300, 50, 100)
+        return decimated_cube
+    
+    def forward_freq_to_freq(self, x_freq): # input and output in freq, costs 2
+        assert x_freq.shape == self.ishape
+        
+        H_spec_x_freq = np.sum(
+            self.H_spec_freq_full * x_freq[:, np.newaxis, ...], axis=0
+        )  # (5, 300, 250, 251) * (5, 1, 250, 251) = (300, 250, 251))
+        convoluted_cube = idft2(H_spec_x_freq)  # (300, 250, 500)
+
+        # make decimated cube
+        decimated_cube = convoluted_cube[
+            :, :: self.di, :: self.dj
+        ]  # (300, 50, 100)
+        return dft2(decimated_cube)
+    
+    def forward_freq_to_real(self, x_freq): # input in freq, output in real, costs 1
+        assert x_freq.shape == self.ishape
+        
+        H_spec_x_freq = np.sum(
+            self.H_spec_freq_full * x_freq[:, np.newaxis, ...], axis=0
+        )  # (5, 300, 250, 251) * (5, 1, 250, 251) = (300, 250, 251))
+        convoluted_cube = idft2(H_spec_x_freq)  # (300, 250, 500)
+
+        # make decimated cube
+        decimated_cube = convoluted_cube[
+            :, :: self.di, :: self.dj
+        ]  # (300, 50, 100)
+        return decimated_cube
+
+    def adjoint(self, y):
+        assert y.shape == self.oshape
+        
+        # bourrage de zéros
+        original_cube = np.zeros(
+            (self.n_lamb, self.shape_target[0], self.shape_target[1])
+        )  # (300, 250, 500)
+        original_cube[:, :: self.di, :: self.dj] = y
+        
+
+        # make convolution with conjugated weighted psfs
+        original_cube_freq = rdft2(original_cube)[np.newaxis, ...]  # (1, 300, 250, 251)
+        # H_spec_x_freq = np.sum(
+        #     np.conj(self.H_spec_freq) * original_cube_freq, axis=1
+        # )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        H_spec_x_freq = einsum(
+            np.conj(self.H_spec_freq) * original_cube_freq, "t l i j -> t i j"
+        )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        maps = irdftn(H_spec_x_freq, self.shape_target)  # (5, 250, 500)
+        
+        return maps  # shape = 5, 250, 500
+    
+    def adjoint_real_to_freq_full(self, y):
+        assert y.shape == self.oshape
+        
+        # bourrage de zéros
+        original_cube = np.zeros(
+            (self.n_lamb, self.shape_target[0], self.shape_target[1])
+        )  # (300, 250, 500)
+        original_cube[:, :: self.di, :: self.dj] = y
+
+        # make convolution with conjugated weighted psfs
+        original_cube_freq = dft2(original_cube)[np.newaxis, ...]  # (1, 300, 250, 251)
+        # H_spec_x_freq = np.sum(
+        #     np.conj(self.H_spec_freq_full) * original_cube_freq, axis=1
+        # )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        
+        H_spec_x_freq = einsum(
+            np.conj(self.H_spec_freq_full) * original_cube_freq, "t l i j -> t i j"
+        )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        
+        return H_spec_x_freq  # shape = 5, 250, 500
+    
+    def adjoint_real_to_freq(self, y):
+        assert y.shape == self.oshape
+        
+        # bourrage de zéros
+        original_cube = np.zeros(
+            (self.n_lamb, self.shape_target[0], self.shape_target[1])
+        )  # (300, 250, 500)
+        original_cube[:, :: self.di, :: self.dj] = y
+
+        # make convolution with conjugated weighted psfs
+        original_cube_freq = rdft2(original_cube)[np.newaxis, ...]  # (1, 300, 250, 251)
+        # H_spec_x_freq = np.sum(
+        #     np.conj(self.H_spec_freq_full) * original_cube_freq, axis=1
+        # )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        
+        H_spec_x_freq = einsum(
+            np.conj(self.H_spec_freq) * original_cube_freq, "t l i j -> t i j"
+        )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        
+        return H_spec_x_freq  # shape = 5, 250, 500
+    
+    # def adjoint_freq_full(self, y): # return adjoint in fourier, and real = False
+    #     assert y.shape == self.oshape
+        
+    #     # bourrage de zéros
+    #     original_cube = np.zeros(
+    #         (self.n_lamb, self.shape_target[0], self.shape_target[1])
+    #     )  # (300, 250, 500)
+    #     original_cube[:, :: self.di, :: self.dj] = y
+        
+
+    #     # make convolution with conjugated weighted psfs
+    #     original_cube_freq = dft2(original_cube)[np.newaxis, ...]  # (1, 300, 250, 251)
+    #     H_spec_x_freq = np.sum(
+    #         np.conj(self.H_spec_freq_full) * original_cube_freq, axis=1
+    #     )  # (5, 300, 250, 251) * (1, 300, 250, 251)
+        
+    #     return H_spec_x_freq  # shape = 5, 250, 500
+
+    def fwadj(self, x):
+        assert x.shape == self.ishape
+        return apply_hessian2(self.hess_spec_freq, self.di, self.dj, self.shape_target, x)
+
+
+class Spectro_Model_3(LinOp):
+    def __init__(
+        self, psfs_monoch, L_pce, di:int, dj:int, lamb_cube, L_specs, shape_target, pixel_arcsec=0.111 # size of pixels before integration and decimation of spectro
+    ):
+        assert shape_target[0] % di == 0
+        assert shape_target[1] % dj == 0
+        
+        assert psfs_monoch.shape[1] <= shape_target[0] # otherwise ir2fr impossible
+        assert psfs_monoch.shape[2] <= shape_target[1]
+        
         kernel_for_sum = np.ones((di, dj)) # le flux est bien intégré sur toute la surface du pixel, sans normalisation
         kernel_for_sum_freq = ir2fr(kernel_for_sum, shape_target, real=False)[np.newaxis, ...] # (1, 250, 500)
 
@@ -1053,18 +1283,14 @@ class Spectro_Model_3(LinOp):
         )
 
     def forward(self, x): # input and output in real, costs 1
-        # assert x.shape == self.ishape
+        assert x.shape == self.ishape
         
-        if self.old_model:
-            x_freq = rdft2(x)
-            H_spec_x_freq = self.psfs_freq * x_freq
-        else:
-            PFreq = self.H_spec_freq
-            x_freq = rdft2(x)[:, np.newaxis, ...]  # (5, 1, 250, 251)
+        PFreq = self.H_spec_freq
+        x_freq = rdft2(x)[:, np.newaxis, ...]  # (5, 1, 250, 251)
 
-            H_spec_x_freq = np.sum(
-                PFreq * x_freq, axis=0
-            )  # (5, 300, 250, 251) * (5, 1, 250, 251) = (300, 250, 251))
+        H_spec_x_freq = np.sum(
+            PFreq * x_freq, axis=0
+        )  # (5, 300, 250, 251) * (5, 1, 250, 251) = (300, 250, 251))
 
         convoluted_cube = irdftn(H_spec_x_freq, self.shape_target)  # (300, 250, 500)
 
