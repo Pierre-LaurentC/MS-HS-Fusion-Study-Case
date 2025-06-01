@@ -16,6 +16,7 @@ from linop import Diff, LinOp
 
 from scipy.integrate import trapezoid
 import itertools as it
+import time
 
 
 
@@ -1653,6 +1654,65 @@ class Mirim_Model_For_Fusion(LinOp):
 # NEW INSTRUMENT FUNCTION FOR FASTER FORWARD
 # =============================================================================
 
+
+def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, pixel_arcsec = 0.111):
+    # print("Use of function {}.".format("make_H_spec_freq_sum"))
+    weighted_psfs = array_psfs * L_pce[..., np.newaxis, np.newaxis] # (300, 250, 500)
+    newaxis_weighted_psfs = weighted_psfs[np.newaxis, ...] # (1, 300, 250, 500)
+    
+    # L_spec = unit_conversion(L_spec, L_lamb * 1e-6, pixel_arcsec)
+    specs = L_spec[..., np.newaxis, np.newaxis] # (5, 300, 1, 1)
+
+    H_spec = newaxis_weighted_psfs * specs # (5, 300, 250, 500)
+
+    H_spec_freq = ir2fr(H_spec, shape_target)
+    
+    # différence par rapport à make_H_spec_freq est ici
+    kernel_for_sum = np.ones((di, dj)) # le flux est bien intégré sur toute la surface du pixel, sans normalisation
+    # print("avant ir2fr de make_H_spec_freq")
+    kernel_for_sum_freq = ir2fr(kernel_for_sum, shape_target)[np.newaxis, np.newaxis, ...] # (1, 1, 250, 251)
+    # print("après ir2fr de make_H_spec_freq")
+    
+    return H_spec_freq * kernel_for_sum_freq # (5, 300, 250, 251)
+
+
+def make_H_spec_freq_sum2_optimized(psfs, L_pce, lambdas, endmembers, shape_target, di, dj):
+    """
+    Optimized and shape-corrected version of make_H_spec_freq_sum2.
+
+    Parameters
+    ----------
+    psfs : (L, H, W)
+    L_pce : (1106, L)
+    lambdas : (L,)
+    endmembers : (5, L)
+    shape_target : (H, W)
+    di, dj : spatial decimation
+
+    Returns
+    -------
+    H_spec_freq : (5, 1106, H, W)
+    """
+    # Step 1: wavelength weights
+    dwl = np.gradient(lambdas)  # (L,)
+
+    # Step 2: PSFs (L, H, W) * (1106, L) * lambdas * dwl -> (1106, L, H, W)
+    weight = L_pce * (lambdas * dwl)[np.newaxis, :]  # (1106, L)
+    instr = psfs[np.newaxis, :, :, :] * weight[:, :, np.newaxis, np.newaxis]  # (1106, L, H, W)
+
+    # Step 3: endmembers (5, L) x instr (1106, L, H, W) => (5, 1106, H, W)
+    H_spec = endmembers[:, :, None, None] * instr # (5, 1106, H, W)
+
+    # Step 4: FFT to frequency domain
+    H_spec_freq = ir2fr(H_spec, shape_target)  # (5, 1106, H, W)
+
+    # Step 5: Multiply by decimation kernel in frequency domain
+    kernel_freq = ir2fr(np.ones((di, dj)), shape_target)  # (H, W)
+    H_spec_freq *= kernel_freq[np.newaxis, np.newaxis, :, :]
+
+    return H_spec_freq
+
+
 class Spectrometer_Model(LinOp):
     def __init__(
         self,
@@ -1708,7 +1768,9 @@ class Spectrometer_Model(LinOp):
         # Validate shapes
         assert abundances.shape == self.ishape
         assert L_specs.shape[0] == abundances.shape[0]
-
+        
+        # start_t = time.time()
+        
         # Build the spectral forward operator H_spec_freq exactly as in the original model
         H_spec_freq = (
             make_H_spec_freq_sum2(
@@ -1732,6 +1794,8 @@ class Spectrometer_Model(LinOp):
         # Back to real space
         response = irdftn(out_freq, self.shape_target)
 
+        # end_t = time.time()
+        # print(f"{end_t-start_t:.6f}")
         if decimate:
             # Decimate spatially
             response = response[:, :: self.di, :: self.dj]
@@ -1929,6 +1993,7 @@ class Imager_Model(LinOp):
         return ir2fr(H_int, self.shape_target, real=False)
 
     def forward(self, abundances: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+
         """
         Real-space forward projection.
 
@@ -2001,4 +2066,155 @@ class Imager_Model(LinOp):
         hess = compute_hess_mirim(Hf)
         part_hess = partitioning_hess_mirim_freq_full2(hess, self.di, self.dj)
         return apply_hessian2(part_hess, self.di, self.dj, self.shape_target, abundances)
+    
 
+
+class Imager_Model_fast(LinOp):
+    def __init__(
+        self,
+        psfs_monoch: np.ndarray,     # (L, H_psf, W_psf)
+        L_pce: np.ndarray,           # (B, L)
+        lamb_cube: np.ndarray,       # (L,)
+        shape_target: tuple[int,int],# (H, W)
+        n_spec: int,                 # number of spectral endmembers (S)
+        di: int,
+        dj: int,
+        pixel_arcsec: float = 0.111
+    ):
+        # validate PSF fits in target
+        assert psfs_monoch.shape[1] <= shape_target[0]
+        assert psfs_monoch.shape[2] <= shape_target[1]
+
+        self.shape_target = shape_target
+        self.di = di
+        self.dj = dj
+        self.n_spec = n_spec
+        self.lamb_cube = lamb_cube
+
+        # number of spectral bands and wavelengths
+        self.n_bands, n_lamb = L_pce.shape
+
+        # 1) store PSFs with a spectral axis for broadcasting
+        #    shape -> (1, 1, L, H_psf, W_psf)
+        # self.psfs = psfs_monoch[np.newaxis, np.newaxis, ...]
+        self.psfs = psfs_monoch[:, np.newaxis, np.newaxis, :, :]
+
+        # 2) unit-convert PCE, then reshape -> (B, 1, L, 1, 1)
+        L_pce_conv = unit_conversion(L_pce, lamb_cube * 1e-6, pixel_arcsec)
+        self.pce = L_pce_conv[:, np.newaxis, :, np.newaxis, np.newaxis]
+
+        # 3) compute PCE normalization factors -> (B, 1, 1, 1)
+        norms = trapezoid(
+            L_pce_conv * lamb_cube[np.newaxis, :],
+            x=lamb_cube,
+            axis=1
+        )
+        self.pce_norms = norms[:, np.newaxis, np.newaxis, np.newaxis]
+        
+        # 4) lamb_cube in broadcast form -> (1, 1, L, 1, 1)
+        self.lamb_cube = lamb_cube[np.newaxis, np.newaxis, :, np.newaxis, np.newaxis]
+
+        self.instrument_response = self.psfs * self.pce * self.lamb_cube
+        self.instrument_response *= np.gradient(self.lamb_cube[0,0,:,0,0])[:, None, None]
+
+
+        # define input and output shapes for LinOp
+        ishape = (self.n_spec, *self.shape_target)  # (S, H, W)
+        oshape = (self.n_bands, *self.shape_target)  # (B, H, W)
+        super().__init__( ishape=ishape, oshape=oshape )
+
+    def _compute_H_freq_full(self, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Optimized computation of frequency-domain instrument response.
+        """
+        wl = self.lamb_cube[0,0,:,0,0]  # (L,)
+
+        # endmembers: (S, L), instrument_response: (B, 1, L, H, W)
+        # einsum computes: sum_l endmembers[s, l] * instr[b, 0, l, h, w] * dwl[l]
+        # H_int = np.einsum('sl,blhw->bshw', endmembers, self.instrument_response[:, 0])
+        H_int = np.tensordot(endmembers, self.instrument_response[:, 0], axes=([1], [1]))  # (S, B, H, W)
+        H_int = np.transpose(H_int, (1, 0, 2, 3))  # -> (B, S, H, W)
+        H_int /= self.pce_norms  # normalize
+
+        return ir2fr(H_int, self.shape_target, real=False)
+
+
+    def forward(self, abundances: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Real-space forward projection.
+
+        Parameters
+        ----------
+        abundances : (S, H, W) abundance maps
+        endmembers : (S, L) spectral signatures
+
+        Returns
+        -------
+        y : (B, H, W) simulated measurements
+        """
+        # start_time = time.time()
+        Hf = self._compute_H_freq_full(endmembers)
+        Xf = dft2(abundances)
+        proj = np.sum(Hf * Xf[np.newaxis, ...], axis=1)
+        
+        # end_time = time.time()
+
+        # Print the time in seconds
+        # print(f"Execution time: {end_time - start_time:.6f} seconds")
+        return np.real(idft2(proj))
+
+    def forward_freq_to_real(self, Xf: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        From frequency-space abundances to real-space measurements.
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        proj = np.sum(Hf * Xf[np.newaxis, ...], axis=1)
+        return np.real(idft2(proj))
+
+    def forward_freq_to_freq(self, Xf: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        From frequency-space abundances to frequency-space measurements.
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        return np.sum(Hf * Xf[np.newaxis, ...], axis=1)
+
+    def adjoint(self, y: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Real-space adjoint projection.
+
+        Parameters
+        ----------
+        y : (B, H, W) measurements
+        endmembers : (S, L) spectral signatures
+
+        Returns
+        -------
+        x_adjoint : (S, H, W) back-projected abundances
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        Yf = dft2(y)
+        back = np.sum(np.conj(Hf) * Yf[:, np.newaxis, ...], axis=0)
+        return np.real(idft2(back))
+
+    def adjoint_real_to_freq_full(self, y: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Real-space to full-frequency adjoint.
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        return np.sum(np.conj(Hf) * dft2(y)[:, np.newaxis, ...], axis=0)
+
+    def adjoint_real_to_freq(self, y: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Real-space to half-frequency adjoint.
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        return np.sum(np.conj(Hf) * rdft2(y)[:, np.newaxis, ...], axis=0)
+
+    def fwadj(self, abundances: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
+        """
+        Hessian-like operation (forward+adjoint) via precomputed Hessian tensor.
+        """
+        Hf = self._compute_H_freq_full(endmembers)
+        hess = compute_hess_mirim(Hf)
+        part_hess = partitioning_hess_mirim_freq_full2(hess, self.di, self.dj)
+        return apply_hessian2(part_hess, self.di, self.dj, self.shape_target, abundances)
