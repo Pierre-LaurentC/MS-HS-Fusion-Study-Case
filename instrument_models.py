@@ -1533,9 +1533,12 @@ class Inv_Regul_Spectro_Model_2():#aljabr.LinOp):
 
 
 
-def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, pixel_arcsec = 0.111):
+def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, apply_psf=True, pixel_arcsec = 0.111):
     # print("Use of function {}.".format("make_H_spec_freq_sum"))
-    weighted_psfs = array_psfs * L_pce[..., np.newaxis, np.newaxis] # (300, 250, 500)
+    if apply_psf:
+        weighted_psfs = array_psfs * L_pce[..., np.newaxis, np.newaxis] # (300, 250, 500)
+    else:
+        weighted_psfs = L_pce[..., np.newaxis, np.newaxis]
     newaxis_weighted_psfs = weighted_psfs[np.newaxis, ...] # (1, 300, 250, 500)
     
     # L_spec = unit_conversion(L_spec, L_lamb * 1e-6, pixel_arcsec)
@@ -1551,7 +1554,10 @@ def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, d
     kernel_for_sum_freq = ir2fr(kernel_for_sum, shape_target)[np.newaxis, np.newaxis, ...] # (1, 1, 250, 251)
     # print("après ir2fr de make_H_spec_freq")
     
-    return H_spec_freq * kernel_for_sum_freq # (5, 300, 250, 251)
+    if apply_psf:
+        return H_spec_freq * kernel_for_sum_freq # (5, 300, 250, 251)
+    else:
+        return H_spec_freq
 
 def make_H_spec_freq_sum2_new(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, pixel_arcsec = 0.111):
     # print("Use of function {}.".format("make_H_spec_freq_sum"))
@@ -1655,9 +1661,12 @@ class Mirim_Model_For_Fusion(LinOp):
 # =============================================================================
 
 
-def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, pixel_arcsec = 0.111):
+def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, dj, apply_psf=True, pixel_arcsec = 0.111):
     # print("Use of function {}.".format("make_H_spec_freq_sum"))
-    weighted_psfs = array_psfs * L_pce[..., np.newaxis, np.newaxis] # (300, 250, 500)
+    if apply_psf:
+        weighted_psfs = array_psfs * L_pce[..., np.newaxis, np.newaxis] # (300, 250, 500)
+    else:
+        weighted_psfs = L_pce[..., np.newaxis, np.newaxis]
     newaxis_weighted_psfs = weighted_psfs[np.newaxis, ...] # (1, 300, 250, 500)
     
     # L_spec = unit_conversion(L_spec, L_lamb * 1e-6, pixel_arcsec)
@@ -1673,7 +1682,10 @@ def make_H_spec_freq_sum2(array_psfs, L_pce, L_lamb, L_spec, shape_target, di, d
     kernel_for_sum_freq = ir2fr(kernel_for_sum, shape_target)[np.newaxis, np.newaxis, ...] # (1, 1, 250, 251)
     # print("après ir2fr de make_H_spec_freq")
     
-    return H_spec_freq * kernel_for_sum_freq # (5, 300, 250, 251)
+    if apply_psf:
+        return H_spec_freq * kernel_for_sum_freq # (5, 300, 250, 251)
+    else:
+        return H_spec_freq
 
 
 def make_H_spec_freq_sum2_optimized(psfs, L_pce, lambdas, endmembers, shape_target, di, dj):
@@ -1723,7 +1735,8 @@ class Spectrometer_Model(LinOp):
         n_spec: int, 
         di: int,
         dj: int,
-        pixel_arcsec: float = 0.111
+        pixel_arcsec: float = 0.111,
+        apply_psf=True,
     ):
         # Validate geometry
         assert shape_target[0] % di == 0, "shape_target height must be divisible by di"
@@ -1740,6 +1753,7 @@ class Spectrometer_Model(LinOp):
         self.lamb_cube = lamb_cube
         self.pixel_arcsec = pixel_arcsec
         self.n_spec = n_spec
+        self.apply_psf = apply_psf
 
         # Precompute shift factor (decal) for Fourier alignment
         decal = np.zeros(shape_target)
@@ -1772,8 +1786,7 @@ class Spectrometer_Model(LinOp):
         # start_t = time.time()
         
         # Build the spectral forward operator H_spec_freq exactly as in the original model
-        H_spec_freq = (
-            make_H_spec_freq_sum2(
+        H_spec_freq_sum = make_H_spec_freq_sum2(
                 self.psfs_monoch,
                 self.L_pce,
                 self.lamb_cube,
@@ -1781,9 +1794,11 @@ class Spectrometer_Model(LinOp):
                 self.shape_target,
                 self.di,
                 self.dj,
+                self.apply_psf,
             )
-            * self.decalf_rd[np.newaxis, np.newaxis, ...]
-        )
+        
+        H_spec_freq = (H_spec_freq_sum * self.decalf_rd[np.newaxis, np.newaxis, ...])
+
 
         # FFT of abundances
         x_freq = rdft2(abundances)[:, np.newaxis, ...]
@@ -2068,6 +2083,9 @@ class Imager_Model(LinOp):
         return apply_hessian2(part_hess, self.di, self.dj, self.shape_target, abundances)
     
 
+# Outputs the same as Imager_Model, but with differences in the range of ~1e-13, which is within the machine epsilon for double-precision (float64)
+# Can be caused by reordering of operations (e.g. a * b * c vs b * c * a)
+# Also known as numerical artifacts
 
 class Imager_Model_fast(LinOp):
     def __init__(
@@ -2079,7 +2097,8 @@ class Imager_Model_fast(LinOp):
         n_spec: int,                 # number of spectral endmembers (S)
         di: int,
         dj: int,
-        pixel_arcsec: float = 0.111
+        pixel_arcsec: float = 0.111,
+        apply_psf=True
     ):
         # validate PSF fits in target
         assert psfs_monoch.shape[1] <= shape_target[0]
@@ -2114,7 +2133,10 @@ class Imager_Model_fast(LinOp):
         # 4) lamb_cube in broadcast form -> (1, 1, L, 1, 1)
         self.lamb_cube = lamb_cube[np.newaxis, np.newaxis, :, np.newaxis, np.newaxis]
 
-        self.instrument_response = self.psfs * self.pce * self.lamb_cube
+        if apply_psf:
+            self.instrument_response = self.psfs * self.pce * self.lamb_cube
+        else:
+            self.instrument_response = self.pce * self.lamb_cube
         self.instrument_response *= np.gradient(self.lamb_cube[0,0,:,0,0])[:, None, None]
 
 
@@ -2137,7 +2159,6 @@ class Imager_Model_fast(LinOp):
         H_int /= self.pce_norms  # normalize
 
         return ir2fr(H_int, self.shape_target, real=False)
-
 
     def forward(self, abundances: np.ndarray, endmembers: np.ndarray) -> np.ndarray:
         """
